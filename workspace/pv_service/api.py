@@ -116,6 +116,141 @@ def create_server(app, host: str = "127.0.0.1", port: int = 8080) -> ThreadingHT
         def do_GET(self):
             self._route("GET")
 
+        def _signal_route(self, method, parts, qs, body):
+            """信号窗口计算子系统路由；返回 None 表示未命中。"""
+            if parts[:3] != ["api", "v1", "signals"]:
+                return None
+            sig = app.signals
+            q = _query(qs)
+            tail = parts[3:]
+
+            # 术语归一版本
+            if tail[:1] == ["terms"]:
+                if method == "POST" and tail == ["terms"]:
+                    tv = sig.create_term_version(
+                        body["mappings"], term_version=body["term_version"],
+                        note=body.get("note", ""), created_by=body.get("created_by"))
+                    return self._send(201 if not tv.get("deduped") else 200, tv)
+                if method == "GET" and tail == ["terms"]:
+                    return self._send(200, sig.list_term_versions())
+                if method == "GET" and len(tail) == 2:
+                    return self._send(200, sig.get_term_version(tail[1]))
+
+            # 监测定义
+            if tail[:1] == ["definitions"]:
+                if method == "POST" and tail == ["definitions"]:
+                    d = sig.create_definition(
+                        body["config"], definition_code=body["definition_code"],
+                        created_by=body.get("created_by"))
+                    return self._send(201 if not d.get("deduped") else 200, d)
+                if method == "GET" and tail == ["definitions"]:
+                    return self._send(200, sig.list_definitions())
+                if method == "GET" and len(tail) == 2:
+                    return self._send(200, sig.get_definition(tail[1]))
+                did = tail[1] if len(tail) >= 2 else None
+                if method == "GET" and len(tail) == 3 and tail[2] == "diffs":
+                    return self._send(200, sig.revision_diffs(
+                        did, window_id=q.get("window_id"),
+                        drug_group=q.get("drug_group"),
+                        event_group=q.get("event_group"),
+                        limit=int(q.get("limit", 200))))
+                if method == "GET" and len(tail) == 3 and tail[2] == "dispositions":
+                    return self._send(200, sig.list_dispositions(
+                        did, disposition=q.get("disposition")))
+                if method == "GET" and len(tail) == 3 and tail[2] == "results":
+                    return self._send(200, sig.window_results(
+                        did, window_id=q.get("window_id"),
+                        run_id=q.get("run_id"), determination=q.get("determination"),
+                        head_only=q.get("head_only", "true").lower() != "false"))
+
+            # 病例版本录入
+            if method == "POST" and tail == ["cases"]:
+                cv = sig.add_case_version(
+                    case_id=body["case_id"], version_no=body.get("version_no"),
+                    change_type=body.get("change_type", "INTAKE"),
+                    source_id=body.get("source_id"), drugs=body.get("drugs"),
+                    events=body.get("events"), causality=body.get("causality"),
+                    report_date=body["report_date"],
+                    merged_from=body.get("merged_from"),
+                    split_from=body.get("split_from"),
+                    active=bool(body.get("active", True)))
+                return self._send(201, cv)
+
+            # 计算运行
+            if tail[:1] == ["runs"]:
+                if method == "POST" and tail == ["runs"]:
+                    run = sig.submit_run(
+                        definition_id=body["definition_id"], cutoff=body["cutoff"],
+                        term_version_id=body["term_version_id"],
+                        mode=body.get("mode", "FULL"),
+                        base_run_id=body.get("base_run_id"),
+                        shard_count=body.get("shard_count"),
+                        requested_by=body.get("requested_by"))
+                    if body.get("wait", True):
+                        run = sig.run_until_published(run["run_id"])
+                    if run.get("deduped"):
+                        return self._send(200, run)
+                    return self._send(201 if run["status"] == "PUBLISHED" else 202, run)
+                if method == "GET" and tail == ["runs"]:
+                    return self._send(200, sig.list_runs(
+                        definition_id=q.get("definition_id"), status=q.get("status")))
+                if len(tail) >= 2:
+                    rid = tail[1]
+                    if method == "GET" and len(tail) == 2:
+                        return self._send(200, sig.get_run(rid))
+                    if method == "GET" and len(tail) == 3 and tail[2] == "exclusions":
+                        return self._send(200, sig.run_exclusions(rid))
+                    if method == "GET" and len(tail) == 3 and tail[2] == "verify":
+                        rep = sig.verify_run_reproducibility(rid)
+                        return self._send(200 if rep["valid"] else 422, rep)
+                    if method == "POST" and len(tail) == 3 and tail[2] == "shards":
+                        return self._send(200, sig.run_shards(
+                            rid, max_shards=body.get("max_shards")))
+                    if method == "POST" and len(tail) == 3 and tail[2] == "publish":
+                        return self._send(200, sig.run_until_published(rid))
+
+            # 信号修订处置 / 详情
+            if tail[:1] == ["revisions"]:
+                if len(tail) < 2:
+                    return None
+                rev_id = tail[1]
+                if method == "GET" and len(tail) == 2:
+                    return self._send(200, sig.get_revision(rev_id))
+                if method == "POST" and len(tail) == 3 and tail[2] == "disposition":
+                    if "expected_revision_no" not in body:
+                        raise DomainError("MISSING_FIELD",
+                                          "缺少 expected_revision_no（乐观修订号）")
+                    view = sig.dispose(
+                        rev_id, body["disposition"],
+                        expected_revision_no=int(body["expected_revision_no"]),
+                        analyst=body["analyst"], note=body.get("note"))
+                    return self._send(200, view)
+
+            # 病例贡献追踪
+            if method == "GET" and tail == ["contributions"]:
+                return self._send(200, sig.contribution_trace(
+                    source_id=q.get("source_id"), definition_id=q.get("definition_id"),
+                    window_id=q.get("window_id"),
+                    include_revoked=q.get("include_revoked", "true").lower() != "false"))
+
+            # 恢复状态
+            if method == "POST" and tail == ["recover"]:
+                recovery = sig.recover()
+                if body.get("resume", False):
+                    recovery["resumed"] = sig.resume_pending(
+                        max_shards=body.get("max_shards"))
+                return self._send(200, recovery)
+
+            # 审计
+            if method == "GET" and tail == ["audit"]:
+                return self._send(200, sig.audit_trail(
+                    event_type=q.get("event_type"),
+                    limit=int(q.get("limit", 500))))
+            if method == "GET" and tail == ["audit", "verify"]:
+                rep = sig.verify_audit_chain()
+                return self._send(200 if rep["valid"] else 422, rep)
+            return None
+
         def do_POST(self):
             self._route("POST")
 
@@ -454,6 +589,11 @@ def create_server(app, host: str = "127.0.0.1", port: int = 8080) -> ThreadingHT
                     return self._send(200, gov.audit_trail(
                         event_type=q.get("event_type"), jurisdiction=q.get("jurisdiction"),
                         limit=int(q.get("limit", 500))))
+
+                # -- 药物安全信号窗口计算 -------------------------------------
+                r = self._signal_route(method, parts, qs, body)
+                if r is not None:
+                    return r
 
                 raise DomainError("NOT_FOUND", f"无此接口: {method} {path}", 404)
             except DomainError as e:

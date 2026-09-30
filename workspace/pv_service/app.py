@@ -10,6 +10,7 @@ from .reporting import ReportingService
 from .rule_gov import RuleGovernanceService
 from .rules import RuleEngine
 from .service import CaseService, Clock
+from .signal_service import SignalService
 
 
 class FixedClock(Clock):
@@ -83,6 +84,9 @@ class Application:
             auto_start=auto_rule_scheduler,
             poll_seconds=(0.05 if poll_seconds <= 1 else poll_seconds))
         self.cases.rule_resolver = self.rules_gov.resolve
+        # 药物安全信号窗口计算子系统（独立 signal.db；可复演运行/只增信号修订）。
+        self.signals = SignalService(
+            f"{data_dir}/signal.db", clock=self.clock, shared_lock=self._lock)
 
     def seed_demo_reference(self):
         # 已预期（listed）的药品-反应对

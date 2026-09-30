@@ -22,6 +22,7 @@
 | **药物安全决定双人会签** | `countersign.py` + `revision.py`：不可变评审单（候选归并/严重等级变化/待发送决定冻结，触发器禁改）；两名不同复核员对同一数据修订号签署才放行，同人重复提交不累计，任一人否决即终态；**复核员身份按 `identity.py` NFKC+大小写+首尾空白规范化稳定判定，空白/非法身份明确拒绝，原始提交值原样留痕，旧库启动时迁移到规范化身份键**；新材料/归并/拆解/规则重算在业务事务内推进修订号并原子作废旧单（意见保留但不能发送）；租约原子领取/到期释放/重启恢复；放行按 `report_id` 只解锁一次；未会签强制拦截发送，老调用可用显式兼容开关 |
 | 可移交的证据包导出与离线核验 | `export_service.py`：自包含 tar（来源原文/版本快照/合并拆分关系/报送回执/审计时间线），清单根 + 每文件 SHA-256 + Ed25519 签名；`verifier.py` 在另一进程纯离线逐项核验 |
 | **药物安全法规规则变更：影响分析与受控启用** | `rule_pkg.py`（不可变规则包内容/HMAC 签名/生效区间/版本化引擎）+ `rule_gov.py`（登记三校验、历史快照试算、受控启用/回滚/定时、检查点续跑、已发送只生成更正候选、治理审计哈希链）；计算/会签/发送路径固定本次规则版本 |
+| **药物安全信号：可复演窗口计算** | `signal_metrics.py`（四格表 + PRR/ROR 对数正态 95%CI + 卡方 + 阈值判定）、`signal_engine.py`（截止线快照/冻结术语归一/归并拆解撤回解析/确定性分片）、`signal_service.py`（定义与术语版本只增、计算键幂等、分片检查点、只增信号修订、撤销-重计贡献台账、可追踪差异、乐观修订号处置、崩溃恢复）、独立 `signal.db`（触发器兜底不可变/去重） |
 
 ## 双人会签（药物安全决定）
 
@@ -150,6 +151,104 @@ python3 -m pv_service.serve --data data/pv --port 8080 --seed-demo \
     --jurisdiction CN --auto-rule-scheduler
 ```
 
+## 药物安全信号：可复演窗口计算
+
+分析员为一个监测问题登记**术语归一版本**与**监测定义**（药品集合、事件分组、
+观察期、最小样本量、PRR/ROR 阈值），随后可对任意**病例版本截止线**反复提交
+窗口计算。结果落在与病例库分离的 `data/<dir>/signal.db`，不反向改动病例库。
+
+### 可复演性是如何冻结的
+
+- **计算键** `computation_key = sha256(定义|截止线|术语版本|模式|基线运行)`：
+  `sig_runs.computation_key UNIQUE` 兜底，并发或重复提交同一参数只产生
+  **一个作业**；相同配置与截止线再次计算返回同一 `run_id`、同一份信号修订。
+- **提交即冻结输入**：提交事务按 `created_at <= cutoff` 选出每病例的最新
+  版本，写入 `sig_run_case_snapshot`；截止线之后的迟到随访/归并/因果修正
+  绝不混入已冻结运行（`GET .../runs/{id}/verify` 只读重算比对校验和）。
+- **术语版本固定**：事件原文按运行冻结的 `sig_terms` 映射到规范事件码；
+  换术语版本会改变计算键，旧运行仍按旧版本可复算。
+- 定义/术语/病例版本表只增（触发器拒绝改删）；浮点使用固定的标准正态
+  97.5% 常量，分片按 `sha256(source_id) % shard_count` 确定性切分。
+
+### 四格表与判定
+
+对每个药品组 D × 事件组 E × 观察期输出 `a/b/c/d`（D∩E / D∩¬E / ¬D∩E /
+¬D∩¬E）与 `n`，并计算 PRR=(a/(a+b))/(c/(c+d))、ROR=ad/(bc)、两者
+95%CI（Woolf 对数正态）与 Pearson 卡方。零格默认不静默加修正（指标为
+`null`，判定 `INSUFFICIENT`/未通过），口径需要 Haldane-Anscombe 修正时
+在定义里显式 `continuity_correction:true`。判定阈值支持 `prr_min`、
+`prr_ci_lower_than`、`ror_min`、`ror_ci_lower_than`、`chi_square_min`、
+`min_n/min_a` 与 `require=ALL|ANY`，输出 `SIGNAL/NO_SIGNAL/INSUFFICIENT`
+及逐项门槛明细。
+
+### 分片、失败与崩溃恢复
+
+全量回算与增量更新都走分片作业：每个分片在**独立短事务**提交检查点
+（计数、花名册、状态与 checksum 落 `sig_run_shards`），崩溃后
+`POST /signals/recover` 重置失败片并从已提交片续跑。只有**全部分片
+COMMITTED** 才在**单个 IMMEDIATE 事务**内发布；任一片失败 → 作业
+FAILED，不发布任何半成品指标/修订。并发推进同一作业只发布一组修订
+（发布是幂等的，重复进入直接返回）。
+
+### 只增信号修订、撤销-重计与可追踪差异
+
+- 发布只向 `sig_signal_revisions` **追加**每个 (定义,窗口,药品组,事件组)
+  的新 `revision_no`；四格计数/指标/判定列由触发器锁定，后台计算**无法
+  覆盖**已发布快照，只有分析师处置列允许状态机更新。
+- 后续窗口遇到迟到随访、病例归并/拆解、撤回或因果评价修正时，发布事务先
+  `revoked=1` 撤销这些窗口的旧贡献，再按新版本写入新贡献。
+  `sig_case_contributions` 的部分唯一索引保证**同一来源在一个窗口只
+  贡献一次**（格归属存该来源的完整 `cells` 快照，整体替换不残留）。
+- 被吸收来源标 `MERGED_AWAY`、撤回标 `WITHDRAWN`、不可映射事件标
+  `EVENT_UNMAPPED`、非监测药品标 `DRUG_NOT_MONITORED`，全部进入可追溯
+  排除清单。修订跨药品组/事件组或病例退出样本时，`sig_signal_diffs`
+  给出病例级 `NEW_ENTERED/EXITED_SAMPLE/DRUG_GROUP_CHANGE/EVENT_GROUP_CHANGE/
+  CAUSALITY_UPDATE/...`（含旧格→新格）与指标 delta。
+
+### 分析师处置与乐观修订号
+
+修订发布后为 `PENDING`，分析师可 `CONFIRMED/REFUTED/WATCH`。处置必须带
+`expected_revision_no`（链头修订号）：基于过期号或对非链头旧修订操作一律
+`409 STALE_REVISION`；**旧修订上已有的确认/驳回/观察结论永久保留**
+（`409 ALREADY_DISPOSED`），新修订是独立 PENDING 行必须重新处置。所有
+动作进入只增的全局审计哈希链 `sig_audit_events`（`GET /signals/audit/verify`
+离线重放核验）。
+
+```bash
+# 端到端：术语版本 + 定义 + 病例版本 + 提交（默认 wait 到发布）
+curl -XPOST localhost:8080/api/v1/signals/terms -d '{
+  "term_version":"terms@1",
+  "mappings":{"肝炎":"HEP","hepatitis":"HEP","头痛":"HEAD"}}'
+curl -XPOST localhost:8080/api/v1/signals/definitions -d '{
+  "definition_code":"HEP-X-2026Q1",
+  "config":{"drug_groups":{"X":["X"]},"event_groups":{"HEP":["HEP"]},
+    "windows":[{"id":"2026Q1","start":"2026-01-01","end":"2026-04-01"}],
+    "min_n":3,"prr_min":2,"prr_ci_lower_than":1,
+    "ror_min":2,"ror_ci_lower_than":1,"require":"ALL"}}'
+curl -XPOST localhost:8080/api/v1/signals/runs -d '{
+  "definition_id":"...","term_version_id":"...","cutoff":"2026-04-01T00:00:00"}'
+```
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| POST/GET | `/api/v1/signals/terms`、`/terms/{id}` | 术语归一版本登记（内容幂等）/列表/详情 |
+| POST/GET | `/api/v1/signals/definitions`、`/definitions/{id}` | 监测定义（内容冻结、相同内容幂等） |
+| POST | `/api/v1/signals/cases` | 录入只增病例版本（含 merged_from/split_from/撤回/因果） |
+| POST/GET | `/api/v1/signals/runs` | 提交计算（计算键幂等；`wait/mode/base_run_id/shard_count`）/列表 |
+| GET | `/api/v1/signals/runs/{id}` | 运行与分片提交进度 |
+| POST | `/api/v1/signals/runs/{id}/shards` | 推进未提交分片（`max_shards`，检查点） |
+| POST | `/api/v1/signals/runs/{id}/publish` | 续跑到可发布并原子发布 |
+| GET | `/api/v1/signals/runs/{id}/verify` | 只读重算核验可复演性（分片校验和/计数比对） |
+| GET | `/api/v1/signals/runs/{id}/exclusions` | 各窗口排除来源及原因 |
+| GET | `/api/v1/signals/definitions/{id}/results` | 窗口四格计数/指标/判定（默认仅链头修订） |
+| GET | `/api/v1/signals/revisions/{id}` | 修订详情：指标 + 冻结入选病例清单 + 差异 |
+| POST | `/api/v1/signals/revisions/{id}/disposition` | 确认/驳回/观察（`expected_revision_no` 乐观号） |
+| GET | `/api/v1/signals/definitions/{id}/diffs` | 修订差异（病例级跨组/退出 + 指标 delta） |
+| GET | `/api/v1/signals/definitions/{id}/dispositions` | 分析师处置历史 |
+| GET | `/api/v1/signals/contributions` | 病例贡献追踪（`source_id/window_id`，含撤销链） |
+| POST | `/api/v1/signals/recover` | 崩溃恢复：重置失败分片，从已提交分片续跑 |
+| GET | `/api/v1/signals/audit`、`/audit/verify` | 审计事件查询 / 哈希链核验 |
+
 ## 证据包与离线核验
 
 安全专员对**病例的某个版本**发起导出，得到一个自包含、可移交、带签名的 tar 包。
@@ -191,8 +290,9 @@ python3 -m pv_service.verify_offline package.tar --json          # 完整结构�
 ## 快速开始
 
 ```bash
-# 运行测试（234 个，含并发、崩溃恢复、幂等、证据包篡改/离线核验、双人会签、
-# 法规规则登记/试算/受控启用/回滚/定时/分片失败/检查点续跑/治理审计链）
+# 运行测试（274 个，含并发、崩溃恢复、幂等、证据包篡改/离线核验、双人会签、
+# 法规规则登记/试算/受控启用/回滚/定时/分片失败/检查点续跑/治理审计链/
+# 信号窗口计算复演/撤销重计/修订差异/乐观处置）
 python3 -m unittest discover -s tests -v
 
 # 端到端剧本演示（无需起服务）
@@ -327,11 +427,19 @@ pv_service/
   export_service.py 导出任务：版本快照绑定、去重、崩溃恢复、内容寻址落盘
   verifier.py       离线核验纯函数（逐项失败，绝不误报有效）
   verify_offline.py 离线核验命令行（另一进程，不连数据库）
+  signal_db.py      信号子库 schema（signal.db）：只增触发器/去重部分唯一索引
+  signal_metrics.py PRR/ROR(95%CI)/卡方纯函数与阈值判定（零格不静默修正）
+  signal_engine.py  截止线快照解析、冻结术语归一、归并/拆解/撤回、确定性分片
+  signal_audit.py   信号子系统全局审计哈希链
+  signal_service.py 监测定义/术语版本、计算键幂等、分片检查点发布、撤销-重计
+                    贡献台账、修订差异、乐观修订号处置、崩溃恢复、复算核验
   app.py            装配（共享锁、参考数据）
   api.py            标准库 http.server 的 JSON 接口
-tests/              234 个测试（归一化/规则、去重、不可变、合并拆分、报送、
+tests/              274 个测试（归一化/规则、去重、不可变、合并拆分、报送、
                      并发、API、重启恢复、审计链、Ed25519、证据包导出/篡改/离线核验、
                      双人会签核心/并发租约/HTTP 接口/兼容开关/
                      复核员身份规范化/旧库身份迁移/
-                     法规规则包/治理/崩溃续跑/治理并发/治理 HTTP）
+                     法规规则包/治理/崩溃续跑/治理并发/治理 HTTP/
+                     信号指标/引擎/复演/撤销重计/差异/处置乐观锁/分片崩溃/
+                     计算键并发幂等/信号 HTTP 接口）
 ```
